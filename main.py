@@ -1,14 +1,14 @@
 import asyncio
 import base64
 import json
+import re
 from datetime import datetime as dt, timedelta as td
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import folium
 import streamlit as st
-import streamlit.components.v1 as components
-from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 
 API_URL = "https://dadosabertos.compras.gov.br/modulo-arp/2_consultarARPItem"
 MAX_CONCURRENCY = 4
@@ -67,6 +67,17 @@ CUSTOM_CSS = """
         font-size: 0.95rem;
         margin-bottom: 0.25rem;
     }
+    .stFolium,
+    .stFolium iframe,
+    .folium-map,
+    iframe[title="streamlit_folium.st_folium"],
+    iframe[title^="streamlit_folium"],
+    div[data-testid="stIframe"],
+    div[data-testid="stIframe"] iframe {
+        height: 650px !important;
+        min-height: 650px !important;
+        width: 100% !important;
+    }
 </style>
 """
 
@@ -105,6 +116,43 @@ def normalize_item(item: Dict) -> Optional[Tuple[str, str, str, str, str]]:
     url = build_ata_url(identificador)
 
     return numero_ata, unidade, fornecedor, identificador, url
+
+
+def filter_results_by_uf(
+    results: List[Dict], uasg_index: Dict[str, Dict[str, str]], uf: str
+) -> List[Dict]:
+    filtered: List[Dict] = []
+    for raw in results:
+        uasg_code = extract_uasg(raw)
+        if not uasg_code:
+            continue
+        uasg_info = uasg_index.get(str(uasg_code))
+        if not uasg_info:
+            continue
+        if uasg_info.get("siglaUf") == uf:
+            filtered.append(raw)
+    return filtered
+
+
+def extract_uf_from_map(map_data: Optional[Dict]) -> Optional[str]:
+    if not map_data:
+        return None
+    candidate = map_data.get("last_object_clicked")
+    if isinstance(candidate, dict):
+        props = candidate.get("properties", {})
+        sigla = props.get("sigla") or candidate.get("sigla")
+        if isinstance(sigla, str) and sigla:
+            return sigla
+    candidate = (
+        map_data.get("last_object_clicked_popup")
+        or map_data.get("last_object_clicked_tooltip")
+    )
+    if not candidate:
+        return None
+    text = str(candidate)
+    text = re.sub(r"<[^>]+>", " ", text)
+    match = re.search(r"\b[A-Z]{2}\b", text)
+    return match.group(0) if match else None
 
 
 def parse_remaining_pages(raw_value) -> int:
@@ -403,10 +451,7 @@ def run_search(
 
 def build_map(results: List[Dict], uasg_index: Dict[str, Dict[str, str]]) -> folium.Map:
     geojson = load_state_geojson(BR_GEOJSON_PATH)
-    municipio_geojson = load_municipio_geojson(BR_MUN_GEOJSON_PATH)
-    municipio_centroids = compute_municipio_centroids(municipio_geojson)
     counts_by_uf: Dict[str, int] = {}
-    marker_data: List[Tuple[str, str, str, str, str, Tuple[float, float]]] = []
 
     for raw in results:
         uasg_code = extract_uasg(raw)
@@ -416,30 +461,17 @@ def build_map(results: List[Dict], uasg_index: Dict[str, Dict[str, str]]) -> fol
         if not uasg_info:
             continue
         uf = uasg_info.get("siglaUf")
-        mun_code = uasg_info.get("codigoMunicipioIbge")
-        mun_name = uasg_info.get("nomeMunicipioIbge")
         if not uf:
             continue
         counts_by_uf[uf] = counts_by_uf.get(uf, 0) + 1
 
-        numero = raw.get("numeroAtaRegistroPreco", "Ata não informada")
-        unidade = raw.get("nomeUnidadeGerenciadora", "Unidade não informada")
-        fornecedor = raw.get("nomeRazaoSocialFornecedor", "Fornecedor não informado")
-        identificador = raw.get("numeroControlePncpAta", "")
-        url = build_ata_url(identificador)
-        mun_key = None
-        if mun_code:
-            try:
-                mun_key = str(int(float(mun_code)))
-            except (TypeError, ValueError):
-                mun_key = str(mun_code)
-        coords = municipio_centroids.get(mun_key) if mun_key else None
-        if coords:
-            marker_data.append((uf, numero, unidade, fornecedor, url, coords))
-        elif mun_name:
-            marker_data.append((uf, numero, unidade, fornecedor, url, (0.0, 0.0)))
-
-    mapa = folium.Map(location=[-14.235, -51.9253], zoom_start=4, tiles=None)
+    mapa = folium.Map(
+        location=[-14.235, -51.9253],
+        zoom_start=4,
+        tiles=None,
+        height="650px",
+        width="100%",
+    )
     max_count = max(counts_by_uf.values(), default=0)
 
     try:
@@ -474,32 +506,14 @@ def build_map(results: List[Dict], uasg_index: Dict[str, Dict[str, str]]) -> fol
     folium.GeoJson(
         geojson_with_counts,
         style_function=style_fn,
+        highlight_function=lambda _: {"weight": 2, "color": "#111827"},
+        popup=folium.GeoJsonPopup(fields=["sigla"], labels=False),
         tooltip=folium.GeoJsonTooltip(
             fields=["name", "sigla", "count"],
             aliases=["Estado", "UF", "Atas"],
             localize=True,
         ),
     ).add_to(mapa)
-
-    cluster = MarkerCluster().add_to(mapa)
-    for uf, numero, unidade, fornecedor, url, coords in marker_data:
-        if not coords or coords == (0.0, 0.0):
-            continue
-        if url:
-            link_html = f'<a href="{url}" target="_blank">Abrir documento</a>'
-        else:
-            link_html = "<span>Documento indisponível</span>"
-        popup_html = (
-            f"<strong>Ata {numero}</strong><br>"
-            f"{unidade}<br>"
-            f"{fornecedor}<br>"
-            f"{link_html}"
-        )
-        folium.Marker(
-            location=coords,
-            tooltip=f"Ata {numero} • {unidade}",
-            popup=folium.Popup(popup_html, max_width=320),
-        ).add_to(cluster)
 
     try:
         bounds = folium.GeoJson(geojson).get_bounds()
@@ -574,12 +588,16 @@ def main() -> None:
         if federal_only:
             uasg_sphere = load_catalog("esfera_uasg.json")
 
-    modo_exibicao = st.radio(
-        "Exibir resultados como",
-        ["Mapa", "Lista"],
-        horizontal=True,
-        index=0,
-    )
+    st.session_state.setdefault("modo_exibicao", "Mapa")
+    if "selected_uf" not in st.session_state:
+        st.session_state["selected_uf"] = None
+    next_mode = st.session_state.pop("next_modo_exibicao", None)
+    if next_mode:
+        st.session_state["modo_exibicao"] = next_mode
+    if st.session_state.pop("reset_view", False):
+        st.session_state["modo_exibicao"] = "Mapa"
+        st.session_state["selected_uf"] = None
+
 
     start_button = st.button(
         "Buscar adesões", type="primary", use_container_width=True, disabled=not codigo
@@ -588,32 +606,64 @@ def main() -> None:
     if start_button and tipo and codigo:
         results = run_search(tipo, codigo, federal_only, uasg_sphere)
         st.session_state["atas"] = results
+        st.session_state["reset_view"] = True
     elif start_button and not codigo:
         st.warning("Selecione um item antes de iniciar a busca.")
 
     results = st.session_state.get("atas", [])
+    modo_exibicao = st.session_state.get("modo_exibicao", "Mapa")
+    selected_uf = st.session_state.get("selected_uf")
     if results:
+        uasg_index = load_uasg_index("uasgs.json")
         if modo_exibicao == "Mapa":
             st.subheader("Mapa das atas encontradas")
-            uasg_index = load_uasg_index("uasgs.json")
+            st.caption("Clique no estado onde deseja encontrar atas para adesão.")
             mapa = build_map(results, uasg_index)
-            components.html(mapa._repr_html_(), height=650, scrolling=False)
-        else:
-            st.subheader("Atas encontradas")
-            for raw in results:
-                normalized = normalize_item(raw)
-                if not normalized:
-                    continue
-                numero, unidade, fornecedor, _, url = normalized
-                st.markdown(
-                    f"""
-                    <div class="result-card">
-                        <div class="status-text">Ata {numero} • {unidade}</div>
-                        <div><a href="{url}" target="_blank">Visualizar documento – {fornecedor}</a></div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            map_data = st_folium(
+                mapa,
+                height=650,
+                use_container_width=True,
+                returned_objects=[
+                    "last_object_clicked",
+                    "last_object_clicked_popup",
+                    "last_object_clicked_tooltip",
+                ],
+            )
+            clicked_uf = extract_uf_from_map(map_data)
+            if clicked_uf and clicked_uf != selected_uf:
+                st.session_state["selected_uf"] = clicked_uf
+                st.session_state["next_modo_exibicao"] = "Lista"
+                st.rerun()
+
+        if modo_exibicao == "Lista":
+            if selected_uf:
+                st.subheader(f"Atas encontradas - {selected_uf}")
+                if st.button("Limpar filtro de estado"):
+                    st.session_state["selected_uf"] = None
+                    st.session_state["next_modo_exibicao"] = "Mapa"
+                    st.rerun()
+                display_results = filter_results_by_uf(results, uasg_index, selected_uf)
+            else:
+                st.subheader("Atas encontradas")
+                display_results = results
+
+            if not display_results:
+                st.info("Nenhuma ata encontrada para este estado.")
+            else:
+                for raw in display_results:
+                    normalized = normalize_item(raw)
+                    if not normalized:
+                        continue
+                    numero, unidade, fornecedor, _, url = normalized
+                    st.markdown(
+                        f"""
+                        <div class="result-card">
+                            <div class="status-text">Ata {numero} • {unidade}</div>
+                            <div><a href="{url}" target="_blank">Visualizar documento – {fornecedor}</a></div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
     elif start_button and tipo and codigo:
         st.info("Nenhuma ata encontrada para este critério.")
 

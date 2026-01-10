@@ -11,6 +11,8 @@ wheels/
 
 .streamlit
 
+getter.ipynb
+
 itens_limpos.json
 itens.json
 test.ipynb
