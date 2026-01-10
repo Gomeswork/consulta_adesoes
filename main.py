@@ -5,13 +5,17 @@ from datetime import datetime as dt, timedelta as td
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
+import folium
 import streamlit as st
+import streamlit.components.v1 as components
+from folium.plugins import MarkerCluster
 
 API_URL = "https://dadosabertos.compras.gov.br/modulo-arp/2_consultarARPItem"
 MAX_CONCURRENCY = 4
-MAX_CONCURRENCY = 4
 DATE_RANGE_DAYS = 360
 PAGE_SIZE = {"Material": 100, "Serviço": 100}
+BR_GEOJSON_PATH = "brasil-estados.geojson"
+BR_MUN_GEOJSON_PATH = "brasil-municipios.geojson"
 
 
 st.set_page_config(
@@ -127,6 +131,150 @@ def extract_uasg(item: Dict) -> Optional[str]:
     return None
 
 
+@st.cache_data
+def load_uasg_index(path: str) -> Dict[str, Dict[str, str]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="latin-1") as f:
+            data = json.load(f)
+    index: Dict[str, Dict[str, str]] = {}
+    for entry in data:
+        code = str(entry.get("codigoUasg", "")).strip()
+        if not code:
+            continue
+        index[code] = entry
+    return index
+
+
+@st.cache_data
+def load_state_geojson(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def polygon_centroid(coords: List[List[float]]) -> Tuple[float, float]:
+    """Calcula o centróide aproximado de um polígono (lon/lat)."""
+    if not coords:
+        return 0.0, 0.0
+
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for idx in range(len(coords) - 1):
+        x0, y0 = coords[idx]
+        x1, y1 = coords[idx + 1]
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+
+    if area == 0.0:
+        xs = [pt[0] for pt in coords]
+        ys = [pt[1] for pt in coords]
+        return (sum(ys) / len(ys), sum(xs) / len(xs))
+
+    area *= 0.5
+    cx /= 6.0 * area
+    cy /= 6.0 * area
+    return (cy, cx)
+
+
+def compute_state_centroids(geojson: Dict) -> Dict[str, Tuple[float, float]]:
+    centroids: Dict[str, Tuple[float, float]] = {}
+    for feature in geojson.get("features", []):
+        sigla = feature.get("properties", {}).get("sigla")
+        geometry = feature.get("geometry", {})
+        if not sigla or not geometry:
+            continue
+        geom_type = geometry.get("type")
+        coords = geometry.get("coordinates", [])
+        if geom_type == "Polygon" and coords:
+            centroid = polygon_centroid(coords[0])
+        elif geom_type == "MultiPolygon" and coords:
+            weighted_lat = 0.0
+            weighted_lon = 0.0
+            total_area = 0.0
+            for polygon in coords:
+                if not polygon:
+                    continue
+                ring = polygon[0]
+                if len(ring) < 3:
+                    continue
+                area = 0.0
+                for idx in range(len(ring) - 1):
+                    x0, y0 = ring[idx]
+                    x1, y1 = ring[idx + 1]
+                    area += x0 * y1 - x1 * y0
+                area = abs(area) / 2.0
+                if area == 0.0:
+                    continue
+                lat, lon = polygon_centroid(ring)
+                weighted_lat += lat * area
+                weighted_lon += lon * area
+                total_area += area
+            if total_area == 0.0:
+                centroid = (0.0, 0.0)
+            else:
+                centroid = (weighted_lat / total_area, weighted_lon / total_area)
+        else:
+            centroid = (0.0, 0.0)
+        centroids[sigla] = centroid
+    return centroids
+
+
+@st.cache_data
+def load_municipio_geojson(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@st.cache_data
+def compute_municipio_centroids(geojson: Dict) -> Dict[str, Tuple[float, float]]:
+    centroids: Dict[str, Tuple[float, float]] = {}
+    for feature in geojson.get("features", []):
+        props = feature.get("properties", {})
+        mun_id = props.get("id")
+        geometry = feature.get("geometry", {})
+        if not mun_id or not geometry:
+            continue
+        geom_type = geometry.get("type")
+        coords = geometry.get("coordinates", [])
+        if geom_type == "Polygon" and coords:
+            centroid = polygon_centroid(coords[0])
+        elif geom_type == "MultiPolygon" and coords:
+            weighted_lat = 0.0
+            weighted_lon = 0.0
+            total_area = 0.0
+            for polygon in coords:
+                if not polygon:
+                    continue
+                ring = polygon[0]
+                if len(ring) < 3:
+                    continue
+                area = 0.0
+                for idx in range(len(ring) - 1):
+                    x0, y0 = ring[idx]
+                    x1, y1 = ring[idx + 1]
+                    area += x0 * y1 - x1 * y0
+                area = abs(area) / 2.0
+                if area == 0.0:
+                    continue
+                lat, lon = polygon_centroid(ring)
+                weighted_lat += lat * area
+                weighted_lon += lon * area
+                total_area += area
+            if total_area == 0.0:
+                centroid = (0.0, 0.0)
+            else:
+                centroid = (weighted_lat / total_area, weighted_lon / total_area)
+        else:
+            centroid = (0.0, 0.0)
+        centroids[str(mun_id)] = centroid
+    return centroids
+
+
 async def fetch_page(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
@@ -152,7 +300,6 @@ async def fetch_page(
 async def search_async(
     tipo: str,
     codigo: str,
-    results_container: st.delta_generator.DeltaGenerator,
     status_placeholder: st.delta_generator.DeltaGenerator,
     federal_only: bool,
     uasg_sphere: Dict[str, str],
@@ -186,17 +333,6 @@ async def search_async(
                 continue
             seen.add(key)
             results.append(raw)
-
-            numero, unidade, fornecedor, _, url = normalized
-            results_container.markdown(
-                f"""
-                <div class="result-card">
-                    <div class="status-text">Ata {numero} • {unidade}</div>
-                    <div><a href="{url}" target="_blank">Visualizar documento – {fornecedor}</a></div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         end_date = dt.today().date()
@@ -242,17 +378,15 @@ def run_search(
     codigo: str,
     federal_only: bool,
     uasg_sphere: Dict[str, str],
-) -> None:
-    results_container = st.container()
+) -> List[Dict]:
     status_placeholder = st.empty()
 
     with st.spinner("Consultando dados, por favor aguarde um momento…"):
         try:
-            asyncio.run(
+            results = asyncio.run(
                 search_async(
                     tipo,
                     codigo,
-                    results_container,
                     status_placeholder,
                     federal_only=federal_only,
                     uasg_sphere=uasg_sphere,
@@ -262,9 +396,120 @@ def run_search(
             status_placeholder.error(
                 "Não foi possível concluir a consulta agora, provavelmente por instabilidades no Compras.gov. Tente novamente em instantes."
             )
+            return []
 
-    if not status_placeholder:
-        status_placeholder.info("Nenhum resultado encontrado para este critério.")
+    return results
+
+
+def build_map(results: List[Dict], uasg_index: Dict[str, Dict[str, str]]) -> folium.Map:
+    geojson = load_state_geojson(BR_GEOJSON_PATH)
+    municipio_geojson = load_municipio_geojson(BR_MUN_GEOJSON_PATH)
+    municipio_centroids = compute_municipio_centroids(municipio_geojson)
+    counts_by_uf: Dict[str, int] = {}
+    marker_data: List[Tuple[str, str, str, str, str, Tuple[float, float]]] = []
+
+    for raw in results:
+        uasg_code = extract_uasg(raw)
+        if not uasg_code:
+            continue
+        uasg_info = uasg_index.get(str(uasg_code))
+        if not uasg_info:
+            continue
+        uf = uasg_info.get("siglaUf")
+        mun_code = uasg_info.get("codigoMunicipioIbge")
+        mun_name = uasg_info.get("nomeMunicipioIbge")
+        if not uf:
+            continue
+        counts_by_uf[uf] = counts_by_uf.get(uf, 0) + 1
+
+        numero = raw.get("numeroAtaRegistroPreco", "Ata não informada")
+        unidade = raw.get("nomeUnidadeGerenciadora", "Unidade não informada")
+        fornecedor = raw.get("nomeRazaoSocialFornecedor", "Fornecedor não informado")
+        identificador = raw.get("numeroControlePncpAta", "")
+        url = build_ata_url(identificador)
+        mun_key = None
+        if mun_code:
+            try:
+                mun_key = str(int(float(mun_code)))
+            except (TypeError, ValueError):
+                mun_key = str(mun_code)
+        coords = municipio_centroids.get(mun_key) if mun_key else None
+        if coords:
+            marker_data.append((uf, numero, unidade, fornecedor, url, coords))
+        elif mun_name:
+            marker_data.append((uf, numero, unidade, fornecedor, url, (0.0, 0.0)))
+
+    mapa = folium.Map(location=[-14.235, -51.9253], zoom_start=4, tiles=None)
+    max_count = max(counts_by_uf.values(), default=0)
+
+    try:
+        import branca.colormap as cm
+
+        colormap = cm.linear.YlGnBu_09.scale(0, max(max_count, 1))
+        colormap.caption = "Atas encontradas"
+        colormap.add_to(mapa)
+        default_fill = "#e2e8f0"
+    except Exception:
+        colormap = None
+        default_fill = "#1f2937"
+
+    geojson_with_counts = json.loads(json.dumps(geojson))
+    for feature in geojson_with_counts.get("features", []):
+        sigla = feature.get("properties", {}).get("sigla")
+        feature["properties"]["count"] = counts_by_uf.get(sigla, 0)
+
+    def style_fn(feature: Dict) -> Dict[str, object]:
+        sigla = feature.get("properties", {}).get("sigla")
+        count = counts_by_uf.get(sigla, 0)
+        fill_color = default_fill
+        if colormap and count > 0:
+            fill_color = colormap(count)
+        return {
+            "fillColor": fill_color,
+            "color": "#1f2937",
+            "weight": 1,
+            "fillOpacity": 0.72 if count > 0 else 0.3,
+        }
+
+    folium.GeoJson(
+        geojson_with_counts,
+        style_function=style_fn,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["name", "sigla", "count"],
+            aliases=["Estado", "UF", "Atas"],
+            localize=True,
+        ),
+    ).add_to(mapa)
+
+    cluster = MarkerCluster().add_to(mapa)
+    for uf, numero, unidade, fornecedor, url, coords in marker_data:
+        if not coords or coords == (0.0, 0.0):
+            continue
+        if url:
+            link_html = f'<a href="{url}" target="_blank">Abrir documento</a>'
+        else:
+            link_html = "<span>Documento indisponível</span>"
+        popup_html = (
+            f"<strong>Ata {numero}</strong><br>"
+            f"{unidade}<br>"
+            f"{fornecedor}<br>"
+            f"{link_html}"
+        )
+        folium.Marker(
+            location=coords,
+            tooltip=f"Ata {numero} • {unidade}",
+            popup=folium.Popup(popup_html, max_width=320),
+        ).add_to(cluster)
+
+    try:
+        bounds = folium.GeoJson(geojson).get_bounds()
+        mapa.fit_bounds(bounds, padding=(20, 20))
+        mapa.options["maxBounds"] = bounds
+        mapa.options["minZoom"] = 4
+    except Exception:
+        pass
+
+    return mapa
 
 
 with open("acanto.png", "rb") as f:
@@ -329,15 +574,48 @@ def main() -> None:
         if federal_only:
             uasg_sphere = load_catalog("esfera_uasg.json")
 
+    modo_exibicao = st.radio(
+        "Exibir resultados como",
+        ["Mapa", "Lista"],
+        horizontal=True,
+        index=0,
+    )
+
     start_button = st.button(
         "Buscar adesões", type="primary", use_container_width=True, disabled=not codigo
     )
 
     if start_button and tipo and codigo:
-        st.session_state["atas"] = []
-        run_search(tipo, codigo, federal_only, uasg_sphere)
+        results = run_search(tipo, codigo, federal_only, uasg_sphere)
+        st.session_state["atas"] = results
     elif start_button and not codigo:
         st.warning("Selecione um item antes de iniciar a busca.")
+
+    results = st.session_state.get("atas", [])
+    if results:
+        if modo_exibicao == "Mapa":
+            st.subheader("Mapa das atas encontradas")
+            uasg_index = load_uasg_index("uasgs.json")
+            mapa = build_map(results, uasg_index)
+            components.html(mapa._repr_html_(), height=650, scrolling=False)
+        else:
+            st.subheader("Atas encontradas")
+            for raw in results:
+                normalized = normalize_item(raw)
+                if not normalized:
+                    continue
+                numero, unidade, fornecedor, _, url = normalized
+                st.markdown(
+                    f"""
+                    <div class="result-card">
+                        <div class="status-text">Ata {numero} • {unidade}</div>
+                        <div><a href="{url}" target="_blank">Visualizar documento – {fornecedor}</a></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+    elif start_button and tipo and codigo:
+        st.info("Nenhuma ata encontrada para este critério.")
 
 
 if __name__ == "__main__":
